@@ -4,19 +4,19 @@ class Rollup
       @klass = klass # or relation
     end
 
-    def rollup(name, column: nil, interval: "day", dimension_names: nil, time_zone: nil, current: true, last: nil, clear: false, &block)
+    def rollup(name, column: nil, interval: 'day', dimension_names: nil, time_zone: nil, current: true, last: nil, clear: false, site_id: nil, &block)
       raise "Name can't be blank" if name.blank?
 
       column ||= @klass.rollup_column || :created_at
       validate_column(column)
 
-      relation = perform_group(name, column: column, interval: interval, time_zone: time_zone, current: current, last: last, clear: clear)
+      relation = perform_group(name, column: column, interval: interval, time_zone: time_zone, current: current, last: last, clear: clear, site_id: site_id)
       result = perform_calculation(relation, &block)
 
       dimension_names = set_dimension_names(dimension_names, relation)
-      records = prepare_result(result, name, dimension_names, interval)
+      records = prepare_result(result, name, dimension_names, interval, site_id)
 
-      maybe_clear(clear, name, interval) do
+      maybe_clear(clear, name, interval, site_id) do
         save_records(records) if records.any?
       end
     end
@@ -32,8 +32,8 @@ class Rollup
       end
     end
 
-    def perform_group(name, column:, interval:, time_zone:, current:, last:, clear:)
-      raise ArgumentError, "Cannot use last and clear together" if last && clear
+    def perform_group(name, column:, interval:, time_zone:, current:, last:, clear:, site_id:)
+      raise ArgumentError, 'Cannot use last and clear together' if last && clear
 
       time_zone ||= Rollup.time_zone
 
@@ -43,7 +43,7 @@ class Rollup
 
       # make sure Groupdate global options aren't applied
       gd_options[:time_zone] = time_zone
-      gd_options[:week_start] = Rollup.week_start if interval.to_s == "week"
+      gd_options[:week_start] = Rollup.week_start if interval.to_s == 'week'
       gd_options[:day_start] = 0 if Utils.date_interval?(interval)
 
       if last
@@ -51,11 +51,11 @@ class Rollup
       elsif !clear
         # if no rollups, compute all intervals
         # if rollups, recompute last interval
-        max_time = Rollup.where(name: name, interval: interval).maximum(Utils.time_sql(interval))
+        max_time = Rollup.where(name: name, interval: interval, site_id: site_id).maximum(Utils.time_sql(interval))
         if max_time
           # for MySQL on Ubuntu 18.04 (and likely other platforms)
           if max_time.is_a?(String)
-            utc = ActiveSupport::TimeZone["Etc/UTC"]
+            utc = ActiveSupport::TimeZone['Etc/UTC']
             max_time = Utils.date_interval?(interval) ? max_time.to_date : utc.parse(max_time).in_time_zone(time_zone)
           end
 
@@ -68,7 +68,7 @@ class Rollup
       # intervals are stored as given
       # we don't normalize intervals (i.e. change 60s -> 1m)
       case interval.to_s
-      when "hour", "day", "week", "month", "quarter", "year"
+      when 'hour', 'day', 'week', 'month', 'quarter', 'year'
         @klass.group_by_period(interval, column, **gd_options)
       when /\A\d+s\z/
         @klass.group_by_second(column, n: interval.to_i, **gd_options)
@@ -87,6 +87,7 @@ class Rollup
         if dimension_names.size != groups.size
           raise ArgumentError, "Expected dimension_names to be size #{groups.size}, not #{dimension_names.size}"
         end
+
         dimension_names
       else
         Utils.check_dimensions if groups.any?
@@ -102,15 +103,13 @@ class Rollup
       # for simplicity, they don't need to be the same
       value = value[1..-2] if value.match(/\A["'`].+["'`]\z/)
 
-      unless value.match(/\A\w+\z/)
-        raise "Cannot determine dimension name: #{group}. Use the dimension_names option"
-      end
+      raise "Cannot determine dimension name: #{group}. Use the dimension_names option" unless value.match(/\A\w+\z/)
 
       value
     end
 
     # calculation can mutate relation, but that's fine
-    def perform_calculation(relation, &block)
+    def perform_calculation(relation)
       if block_given?
         yield(relation)
       else
@@ -118,7 +117,7 @@ class Rollup
       end
     end
 
-    def prepare_result(result, name, dimension_names, interval)
+    def prepare_result(result, name, dimension_names, interval, site_id)
       raise "Expected calculation to return Hash, not #{result.class.name}" unless result.is_a?(Hash)
 
       time_class = Utils.date_interval?(interval) ? Date : Time
@@ -131,6 +130,7 @@ class Rollup
           unless key.is_a?(Array) && key.size == expected_key_size
             raise "Expected result key to be Array with size #{expected_key_size}"
           end
+
           time = key[-1]
           # may be able to support dimensions in SQLite by sorting dimension names
           dimension_names.each_with_index do |dn, i|
@@ -144,6 +144,7 @@ class Rollup
         raise "Expected value to be Numeric or nil, not #{value.class.name}" unless value.is_a?(Numeric) || value.nil?
 
         record = {
+          site_id: site_id,
           name: name,
           interval: interval,
           time: time,
@@ -154,10 +155,10 @@ class Rollup
       end
     end
 
-    def maybe_clear(clear, name, interval)
+    def maybe_clear(clear, name, interval, site_id)
       if clear
         Rollup.transaction do
-          Rollup.where(name: name, interval: interval).delete_all
+          Rollup.where(name: name, interval: interval, site_id: site_id).delete_all
           yield
         end
       else
@@ -168,18 +169,17 @@ class Rollup
     def save_records(records)
       # order must match unique index
       # consider using index name instead
-      conflict_target = [:name, :interval, :time]
+      conflict_target = %i[site_id name interval time]
       conflict_target << :dimensions if Utils.dimensions_supported?
 
       if ActiveRecord::VERSION::MAJOR >= 6
-        options = Utils.mysql? ? {} : {unique_by: conflict_target}
+        options = Utils.mysql? ? {} : { unique_by: conflict_target }
         Rollup.upsert_all(records, **options)
       else
-        update = Utils.mysql? ? [:value] : {columns: [:value], conflict_target: conflict_target}
+        update = Utils.mysql? ? [:value] : { columns: [:value], conflict_target: conflict_target }
         Rollup.import(records,
-          on_duplicate_key_update: update,
-          validate: false
-        )
+                      on_duplicate_key_update: update,
+                      validate: false)
       end
     end
   end
